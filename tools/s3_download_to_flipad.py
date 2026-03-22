@@ -19,6 +19,7 @@
 
 import argparse
 import hashlib
+import logging
 import os
 import time
 from pathlib import Path
@@ -101,6 +102,8 @@ def _select_smallest_by_score(
     need: Need,
     extra: int,
     key_filter: Callable[[str], bool],
+    logger: Optional[logging.Logger] = None,
+    progress_every: int = 100000,
 ) -> Dict[str, List[str]]:
     """
     Детерминированно выбираем (need+extra) ключей для каждого split, независимо от порядка листинга.
@@ -128,8 +131,15 @@ def _select_smallest_by_score(
         if len(h) > lim:
             heapq.heappop(h)
         # редкий прогресс
-        if seen % 100000 == 0:
-            pass
+        if logger and progress_every > 0 and seen % progress_every == 0:
+            logger.info(
+                "select progress: seen=%d kept=%d heaps={train:%d,val:%d,test:%d}",
+                seen,
+                kept,
+                len(heaps["train"]),
+                len(heaps["val"]),
+                len(heaps["test"]),
+            )
 
     out = {}  # type: Dict[str, List[str]]
     for sp, h in heaps.items():
@@ -201,11 +211,47 @@ def main() -> None:
     ap.add_argument("--max-real-list", type=int, default=None, help="Ограничить листинг real ключей (для отладки).")
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="Куда писать лог-файл. По умолчанию: <data-path>/<dataset>/_logs/.",
+    )
 
     args = ap.parse_args()
 
     if not args.access_key or not args.secret_key:
         raise SystemExit("Нужны AWS_ACCESS_KEY_ID и AWS_SECRET_ACCESS_KEY (через env или флаги).")
+
+    # ---- logging ----
+    base = args.data_path / args.dataset
+    log_dir = args.log_dir if args.log_dir is not None else (base / "_logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / ("s3_download_to_flipad_%s.log" % ts)
+
+    logger = logging.getLogger("s3_download_to_flipad")
+    logger.setLevel(logging.INFO)
+    logger.handlers = []
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    fh = logging.FileHandler(str(log_path))
+    fh.setFormatter(fmt)
+    logger.addHandler(sh)
+    logger.addHandler(fh)
+    logger.info("log file: %s", str(log_path))
+    logger.info(
+        "args: data_path=%s dataset=%s stego_dir=%s real_dir=%s seed=%d workers=%d dry_run=%s extra=%d",
+        str(args.data_path),
+        args.dataset,
+        args.stego_dir,
+        args.real_dir,
+        int(args.seed),
+        int(args.workers),
+        bool(args.dry_run),
+        int(args.extra),
+    )
 
     s3 = make_s3_client(args.endpoint, args.region, args.access_key, args.secret_key)
 
@@ -223,7 +269,7 @@ def main() -> None:
             if n >= limit:
                 return
 
-    print("Listing+selecting stego keys...", flush=True)
+    logger.info("Listing+selecting stego keys: prefix=%s", args.stego_prefix)
     stego_keys = limited(iter_keys(s3, args.bucket, args.stego_prefix), args.max_stego_list)
     stego_sel = _select_smallest_by_score(
         keys=stego_keys,
@@ -231,10 +277,11 @@ def main() -> None:
         need=stego_need,
         extra=args.extra,
         key_filter=lambda k: ("/identity/" in k and k.endswith(".png")),
+        logger=logger,
     )
-    print({k: len(v) for k, v in stego_sel.items()}, flush=True)
+    logger.info("stego selected (incl extra): %s", str({k: len(v) for k, v in stego_sel.items()}))
 
-    print("Listing+selecting real keys...", flush=True)
+    logger.info("Listing+selecting real keys: prefix=%s", args.real_prefix)
     real_keys = limited(iter_keys(s3, args.bucket, args.real_prefix), args.max_real_list)
     real_sel = _select_smallest_by_score(
         keys=real_keys,
@@ -242,10 +289,10 @@ def main() -> None:
         need=real_need,
         extra=args.extra,
         key_filter=lambda k: k.endswith(".png"),
+        logger=logger,
     )
-    print({k: len(v) for k, v in real_sel.items()}, flush=True)
+    logger.info("real selected (incl extra): %s", str({k: len(v) for k, v in real_sel.items()}))
 
-    base = args.data_path / args.dataset
     out_stego = base / args.stego_dir
     out_real = base / args.real_dir
 
@@ -262,9 +309,10 @@ def main() -> None:
         (manifests / f"real_{sp}_download.txt").write_text(
             "\n".join(real_sel[sp][: real_need.for_split(sp)]) + "\n"
         )
+    logger.info("manifests written to: %s", str(manifests))
 
     if args.dry_run:
-        print("Dry-run: manifests written to", manifests, flush=True)
+        logger.info("Dry-run: stopping before download.")
         return
 
     # скачиваем параллельно
@@ -283,7 +331,14 @@ def main() -> None:
                     bad += 1
                 if i % 1000 == 0:
                     dt = time.time() - t0
-                    print(f"progress {i}/{len(futs)} ok={ok} bad={bad} rate={ok/max(dt,1e-6):.1f} file/s", flush=True)
+                    logger.info(
+                        "download progress: %d/%d ok=%d bad=%d rate=%.1f file/s",
+                        i,
+                        len(futs),
+                        ok,
+                        bad,
+                        ok / max(dt, 1e-6),
+                    )
         return ok, bad
 
     def build_pairs(sel, root):
@@ -298,16 +353,12 @@ def main() -> None:
     stego_pairs = build_pairs(stego_sel, out_stego)
     real_pairs = build_pairs(real_sel, out_real)
 
-    print("Downloading stego...", len(stego_pairs), flush=True)
+    logger.info("Downloading stego... files=%d -> %s", len(stego_pairs), str(out_stego))
     ok_s, bad_s = submit_all(stego_pairs)
-    print("Downloading real...", len(real_pairs), flush=True)
+    logger.info("Downloading real... files=%d -> %s", len(real_pairs), str(out_real))
     ok_r, bad_r = submit_all(real_pairs)
 
-    print(
-        "Done.",
-        {"stego_ok": ok_s, "stego_bad": bad_s, "real_ok": ok_r, "real_bad": bad_r},
-        flush=True,
-    )
+    logger.info("Done. %s", str({"stego_ok": ok_s, "stego_bad": bad_s, "real_ok": ok_r, "real_bad": bad_r}))
 
 
 if __name__ == "__main__":
