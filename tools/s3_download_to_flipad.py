@@ -17,15 +17,12 @@
 Важно: скрипт НЕ использует самописный DCT. Это только загрузка PNG на диск.
 """
 
-from __future__ import annotations
-
 import argparse
 import hashlib
 import os
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import boto3
 from botocore.config import Config
@@ -81,11 +78,11 @@ def iter_keys(s3, bucket: str, prefix: str) -> Iterator[str]:
             yield obj["Key"]
 
 
-@dataclass
 class Need:
-    train: int
-    val: int
-    test: int
+    def __init__(self, train: int, val: int, test: int):
+        self.train = int(train)
+        self.val = int(val)
+        self.test = int(test)
 
     def for_split(self, sp: str) -> int:
         if sp == "train":
@@ -103,15 +100,15 @@ def _select_smallest_by_score(
     seed: int,
     need: Need,
     extra: int,
-    key_filter: callable,
-) -> dict[str, list[str]]:
+    key_filter: Callable[[str], bool],
+) -> Dict[str, List[str]]:
     """
     Детерминированно выбираем (need+extra) ключей для каждого split, независимо от порядка листинга.
     Реализация: для каждого split держим max-heap по score и оставляем самые маленькие score.
     """
     import heapq
 
-    heaps: dict[str, list[tuple[int, str]]] = {"train": [], "val": [], "test": []}  # (-score, key)
+    heaps = {"train": [], "val": [], "test": []}  # type: Dict[str, List[Tuple[int, str]]]  # (-score, key)
     limits = {sp: need.for_split(sp) + extra for sp in ["train", "val", "test"]}
 
     seen = 0
@@ -134,7 +131,7 @@ def _select_smallest_by_score(
         if seen % 100000 == 0:
             pass
 
-    out: dict[str, list[str]] = {}
+    out = {}  # type: Dict[str, List[str]]
     for sp, h in heaps.items():
         # извлекаем, сортируем по score по возрастанию
         arr = [(-neg_sc, k) for (neg_sc, k) in h]
@@ -273,7 +270,7 @@ def main() -> None:
     # скачиваем параллельно
     import concurrent.futures as cf
 
-    def submit_all(pairs: list[tuple[str, Path]]):
+    def submit_all(pairs):
         ok = 0
         bad = 0
         t0 = time.time()
@@ -289,8 +286,8 @@ def main() -> None:
                     print(f"progress {i}/{len(futs)} ok={ok} bad={bad} rate={ok/max(dt,1e-6):.1f} file/s", flush=True)
         return ok, bad
 
-    def build_pairs(sel: dict[str, list[str]], root: Path) -> list[tuple[str, Path]]:
-        pairs: list[tuple[str, Path]] = []
+    def build_pairs(sel, root):
+        pairs = []  # type: List[Tuple[str, Path]]
         for sp in ["train", "val", "test"]:
             # Важно для диска: на диск кладём только "required" (extra остаётся в manifests как запас)
             required = stego_need.for_split(sp) if root == out_stego else real_need.for_split(sp)
